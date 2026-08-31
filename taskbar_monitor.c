@@ -13,6 +13,12 @@
 #define IDM_INTERVAL_5S 1012
 #define IDM_EXIT 1099
 #define IDI_APP 1
+#define MAX_COLOR_RULES 16
+
+typedef struct ColorRule {
+    int min_percent;
+    COLORREF color;
+} ColorRule;
 
 static NOTIFYICONDATAA g_notify;
 static UINT g_interval_ms = 1000;
@@ -22,6 +28,111 @@ static ULONGLONG g_prev_user = 0;
 static BOOL g_have_cpu_sample = FALSE;
 static HANDLE g_single_instance = NULL;
 static HICON g_tray_icon = NULL;
+static ColorRule g_color_rules[MAX_COLOR_RULES];
+static int g_color_rule_count = 0;
+
+static void add_color_rule(int min_percent, int red, int green, int blue) {
+    if (g_color_rule_count >= MAX_COLOR_RULES) {
+        return;
+    }
+    if (min_percent < 0 || min_percent > 100 ||
+        red < 0 || red > 255 ||
+        green < 0 || green > 255 ||
+        blue < 0 || blue > 255) {
+        return;
+    }
+    g_color_rules[g_color_rule_count].min_percent = min_percent;
+    g_color_rules[g_color_rule_count].color = RGB(red, green, blue);
+    g_color_rule_count++;
+}
+
+static void sort_color_rules(void) {
+    int i, j;
+    for (i = 0; i < g_color_rule_count - 1; i++) {
+        for (j = i + 1; j < g_color_rule_count; j++) {
+            if (g_color_rules[j].min_percent > g_color_rules[i].min_percent) {
+                ColorRule temp = g_color_rules[i];
+                g_color_rules[i] = g_color_rules[j];
+                g_color_rules[j] = temp;
+            }
+        }
+    }
+}
+
+static void load_default_color_rules(void) {
+    g_color_rule_count = 0;
+    add_color_rule(90, 128, 0, 128);
+    add_color_rule(80, 220, 20, 60);
+    add_color_rule(70, 255, 215, 0);
+    add_color_rule(50, 0, 112, 192);
+    add_color_rule(0, 0, 176, 80);
+}
+
+static void get_config_path(char *path, DWORD path_size) {
+    DWORD length = GetModuleFileNameA(NULL, path, path_size);
+    char *last_slash;
+
+    if (length == 0 || length >= path_size) {
+        lstrcpynA(path, "memory-colors.cfg", path_size);
+        return;
+    }
+
+    last_slash = strrchr(path, '\\');
+    if (!last_slash) {
+        last_slash = strrchr(path, '/');
+    }
+    if (last_slash) {
+        *(last_slash + 1) = '\0';
+        lstrcatA(path, "memory-colors.cfg");
+    } else {
+        lstrcpynA(path, "memory-colors.cfg", path_size);
+    }
+}
+
+static void load_color_rules(void) {
+    char path[MAX_PATH];
+    char line[128];
+    FILE *file = NULL;
+    ColorRule loaded_rules[MAX_COLOR_RULES];
+    int loaded_count = 0;
+
+    load_default_color_rules();
+    get_config_path(path, sizeof(path));
+
+    if (fopen_s(&file, path, "r") != 0 || !file) {
+        return;
+    }
+
+    while (fgets(line, sizeof(line), file)) {
+        int min_percent, red, green, blue;
+        char marker;
+        if (line[0] == '#' || line[0] == ';' || line[0] == '\r' || line[0] == '\n') {
+            continue;
+        }
+        if (sscanf_s(line, " %d %d %d %d %c", &min_percent, &red, &green, &blue, &marker, 1) != 4) {
+            continue;
+        }
+        if (min_percent < 0 || min_percent > 100 ||
+            red < 0 || red > 255 ||
+            green < 0 || green > 255 ||
+            blue < 0 || blue > 255 ||
+            loaded_count >= MAX_COLOR_RULES) {
+            continue;
+        }
+        loaded_rules[loaded_count].min_percent = min_percent;
+        loaded_rules[loaded_count].color = RGB(red, green, blue);
+        loaded_count++;
+    }
+    fclose(file);
+
+    if (loaded_count == 0) {
+        return;
+    }
+
+    g_color_rule_count = loaded_count;
+    memcpy(g_color_rules, loaded_rules, sizeof(ColorRule) * loaded_count);
+    sort_color_rules();
+}
 
 static BOOL register_startup(void) {
     HKEY key;
@@ -112,17 +223,11 @@ static int get_memory_percent(void) {
 }
 
 static COLORREF get_memory_color(int memory) {
-    if (memory >= 90) {
-        return RGB(128, 0, 128);
-    }
-    if (memory >= 80) {
-        return RGB(220, 20, 60);
-    }
-    if (memory >= 70) {
-        return RGB(255, 215, 0);
-    }
-    if (memory >= 50) {
-        return RGB(0, 112, 192);
+    int i;
+    for (i = 0; i < g_color_rule_count; i++) {
+        if (memory >= g_color_rules[i].min_percent) {
+            return g_color_rules[i].color;
+        }
     }
     return RGB(0, 176, 80);
 }
@@ -379,6 +484,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
         CloseHandle(g_single_instance);
         return 0;
     }
+    load_color_rules();
     register_startup();
     ZeroMemory(&window_class, sizeof(window_class));
     window_class.lpfnWndProc = window_proc;
