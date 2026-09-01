@@ -7,6 +7,7 @@
 
 #define WM_TRAYICON (WM_APP + 1)
 #define TIMER_MONITOR 1
+#define TIMER_BLINK 2
 #define IDM_REFRESH 1001
 #define IDM_INTERVAL_1S 1010
 #define IDM_INTERVAL_2S 1011
@@ -28,6 +29,7 @@ static ULONGLONG g_prev_user = 0;
 static BOOL g_have_cpu_sample = FALSE;
 static HANDLE g_single_instance = NULL;
 static HICON g_tray_icon = NULL;
+static BOOL g_blink_phase = FALSE;
 static ColorRule g_color_rules[MAX_COLOR_RULES];
 static int g_color_rule_count = 0;
 
@@ -232,9 +234,10 @@ static COLORREF get_memory_color(int memory) {
     return RGB(0, 176, 80);
 }
 
-static HICON create_memory_icon(int memory) {
+static HICON create_memory_icon(int memory, BOOL blink_phase) {
     const int size = 32;
-    COLORREF color = get_memory_color(memory);
+    COLORREF background_color;
+    COLORREF foreground_color;
     BITMAPINFO bmi;
     void *bits = NULL;
     HBITMAP color_bitmap = NULL;
@@ -247,6 +250,14 @@ static HICON create_memory_icon(int memory) {
     ICONINFO icon_info;
     DWORD *pixels;
     DWORD fill_color;
+
+    if (memory > 90) {
+        background_color = blink_phase ? RGB(128, 0, 128) : RGB(0, 0, 0);
+        foreground_color = blink_phase ? RGB(0, 0, 0) : RGB(128, 0, 128);
+    } else {
+        background_color = get_memory_color(memory);
+        foreground_color = RGB(25, 25, 25);
+    }
 
     ZeroMemory(&bmi, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -277,16 +288,16 @@ static HICON create_memory_icon(int memory) {
     }
 
     fill_color = 0xFF000000UL |
-                 ((DWORD)GetRValue(color) << 16) |
-                 ((DWORD)GetGValue(color) << 8) |
-                 (DWORD)GetBValue(color);
+                 ((DWORD)GetRValue(background_color) << 16) |
+                 ((DWORD)GetGValue(background_color) << 8) |
+                 (DWORD)GetBValue(background_color);
     pixels = (DWORD *)bits;
     for (int i = 0; i < size * size; ++i) {
         pixels[i] = fill_color;
     }
 
-    pen = CreatePen(PS_SOLID, 2, RGB(25, 25, 25));
-    brush = CreateSolidBrush(RGB(25, 25, 25));
+    pen = CreatePen(PS_SOLID, 2, foreground_color);
+    brush = CreateSolidBrush(foreground_color);
     if (!pen || !brush) {
         goto cleanup;
     }
@@ -331,13 +342,11 @@ cleanup:
     return icon;
 }
 
-static void update_tray_icon(void) {
+static void update_tray_icon_with_memory(int memory) {
     HICON next_icon;
     HICON previous_icon;
-    int memory;
 
-    memory = get_memory_percent();
-    next_icon = create_memory_icon(memory);
+    next_icon = create_memory_icon(memory, g_blink_phase);
     if (!next_icon) {
         return;
     }
@@ -355,6 +364,10 @@ static void update_tray_icon(void) {
     if (previous_icon) {
         DestroyIcon(previous_icon);
     }
+}
+
+static void update_tray_icon(void) {
+    update_tray_icon_with_memory(get_memory_percent());
 }
 
 static void update_tooltip(void) {
@@ -377,6 +390,8 @@ static void set_interval(HWND window, UINT interval_ms) {
     g_interval_ms = interval_ms;
     KillTimer(window, TIMER_MONITOR);
     SetTimer(window, TIMER_MONITOR, g_interval_ms, NULL);
+    KillTimer(window, TIMER_BLINK);
+    SetTimer(window, TIMER_BLINK, 1000, NULL);
     update_tray_icon();
     update_tooltip();
 }
@@ -414,12 +429,22 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
     case WM_CREATE:
         update_tooltip();
         SetTimer(window, TIMER_MONITOR, g_interval_ms, NULL);
+        SetTimer(window, TIMER_BLINK, 1000, NULL);
         return 0;
 
     case WM_TIMER:
         if (wparam == TIMER_MONITOR) {
             update_tray_icon();
             update_tooltip();
+        } else if (wparam == TIMER_BLINK) {
+            int memory = get_memory_percent();
+            if (memory > 90) {
+                g_blink_phase = !g_blink_phase;
+                update_tray_icon_with_memory(memory);
+            } else if (g_blink_phase) {
+                g_blink_phase = FALSE;
+                update_tray_icon_with_memory(memory);
+            }
         }
         return 0;
 
@@ -456,6 +481,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 
     case WM_DESTROY:
         KillTimer(window, TIMER_MONITOR);
+        KillTimer(window, TIMER_BLINK);
         Shell_NotifyIconA(NIM_DELETE, &g_notify);
         if (g_tray_icon) {
             DestroyIcon(g_tray_icon);
@@ -508,7 +534,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     g_notify.uCallbackMessage = WM_TRAYICON;
     lstrcpynA(g_notify.szTip, "CPU --% | MEM --%", sizeof(g_notify.szTip));
 
-    g_tray_icon = create_memory_icon(get_memory_percent());
+    g_tray_icon = create_memory_icon(get_memory_percent(), g_blink_phase);
     g_notify.hIcon = g_tray_icon;
 
     if (!Shell_NotifyIconA(NIM_ADD, &g_notify)) {
